@@ -118,7 +118,7 @@ async def handle_any_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = (update.message.text or "").strip()
 
     if text == "📋 Шаблон SKU":
-await update.message.reply_text(TEMPLATE, reply_markup=KB)
+        await update.message.reply_text(TEMPLATE, reply_markup=KB)
         return
 
     if text == "♻️ Очистить":
