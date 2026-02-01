@@ -337,9 +337,9 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data.clear()
         context.user_data["await_cogs"] = True
         await update.message.reply_text(
-            "Пришли CSV файл себестоимости в формате:\n\n"
-            "sku,cogs\n"
-            "ABC-123,380\n"
+            "Пришли Excel файл себестоимости в формате:\n\n"
+            "SKU, Себестоимость\n"
+            "ABC-123, 3800\n"
             "XYZ-777,1250\n\n"
             "Разделитель может быть ',' или ';'.",
             reply_markup=BACK_TO_MENU_KB
@@ -348,7 +348,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # 2) Если ждём файл — подсказываем
     if context.user_data.get("await_report"):
-        await update.message.reply_text("Я жду файл отчёта (.xlsx/.csv). Пришли документом.", reply_markup=MODE_KB)
+        await update.message.reply_text("Я жду файл отчёта. Пришли документом Excel.", reply_markup=MODE_KB)
         return
 
     if context.user_data.get("await_cogs"):
