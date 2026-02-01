@@ -14,9 +14,9 @@ TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 
 if not TELEGRAM_BOT_TOKEN:
-    raise RuntimeError("Нет TELEGRAM_BOT_TOKEN. Добавь переменную окружения в Render.")
+    raise RuntimeError("Нет TELEGRAM_BOT_TOKEN. Добавь переменную окружения в Railway.")
 if not OPENAI_API_KEY:
-    raise RuntimeError("Нет OPENAI_API_KEY. Добавь переменную окружения в Render.")
+    raise RuntimeError("Нет OPENAI_API_KEY. Добавь переменную окружения в Railway.")
 
 client = OpenAI(api_key=OPENAI_API_KEY)
 
@@ -50,18 +50,16 @@ KB = ReplyKeyboardMarkup(
         ["📈 Что если +5%", "📉 Что если −10%"],
         ["🔥 Можно ли в акцию", "♻️ Очистить"],
     ],
-    resize_keyboard=True
+    resize_keyboard=True,
 )
 
-def _extract_number(text: str) -> float | None:
-    # вытаскивает первое число из строки (учитывает запятую)
+def _extract_number(text: str):
     m = re.search(r"(-?\d+(?:[.,]\d+)?)", text)
     if not m:
         return None
     return float(m.group(1).replace(",", "."))
 
 def parse_sku_block(text: str) -> dict:
-    # принимает блок строк вида "Ключ: значение"
     data = {}
     for line in text.splitlines():
         if ":" not in line:
@@ -70,7 +68,7 @@ def parse_sku_block(text: str) -> dict:
         key = k.strip().lower()
         val = v.strip()
 
-        if key in ["sku"]:
+        if key == "sku":
             data["sku"] = val
         elif "цена покуп" in key:
             data["price"] = _extract_number(val)
@@ -85,12 +83,11 @@ def parse_sku_block(text: str) -> dict:
         elif "акц" in key:
             data["promo_pct"] = _extract_number(val)
         elif "конкур" in key:
-            # числа через запятую/пробел
             nums = re.findall(r"\d+(?:[.,]\d+)?", val)
             data["competitors"] = [float(x.replace(",", ".")) for x in nums] if nums else []
     return data
 
-def data_is_ok(d: dict) -> tuple[bool, str]:
+def data_is_ok(d: dict):
     required = ["sku", "price", "cogs", "fee_pct", "log", "promo_pct"]
     missing = [k for k in required if (k not in d or d[k] is None or (k == "sku" and not d[k]))]
     if missing:
@@ -125,7 +122,10 @@ async def handle_any_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if text == "♻️ Очистить":
         context.user_data["sku_raw"] = ""
         context.user_data["sku_parsed"] = {}
-        await update.message.reply_text("Ок, очистил. Вставь данные заново или жми “Шаблон SKU”.", reply_markup=KB)
+        await update.message.reply_text(
+            "Ок, очистил. Вставь данные заново или жми “Шаблон SKU”.",
+            reply_markup=KB,
+        )
         return
 
     # если пользователь прислал блок данных — запомним
@@ -137,22 +137,27 @@ async def handle_any_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if ok:
             await update.message.reply_text("Данные принял ✅ Жми “Посчитать”.", reply_markup=KB)
         else:
-            await update.message.reply_text(f"Принял, но: {reason}\n\nЖми “Шаблон SKU” и заполни всё.", reply_markup=KB)
+            await update.message.reply_text(
+                f"Принял, но: {reason}\n\nЖми “Шаблон SKU” и заполни всё.",
+                reply_markup=KB,
+            )
         return
 
-    # действия кнопками
     action_map = {
         "📊 Посчитать": "Посчитай по этим данным.",
         "📈 Что если +5%": "Посчитай, что будет если цену покупателя увеличить на +5%.",
         "📉 Что если −10%": "Посчитай, что будет если цену покупателя снизить на −10%.",
-        "🔥 Можно ли в акцию": "Ответь, можно ли участвовать в акции при текущих данных. Если нельзя — какая минимальная цена/маржа нужна.",
+        "🔥 Можно ли в акцию": "Ответь, можно ли участвовать в акции при текущих данных. Если нельзя — кратко почему.",
     }
 
     if text in action_map:
         parsed = context.user_data.get("sku_parsed", {}) or {}
         ok, reason = data_is_ok(parsed)
         if not ok:
-            await update.message.reply_text(f"Сначала пришли данные SKU.\n{reason}\n\nЖми “Шаблон SKU”.", reply_markup=KB)
+            await update.message.reply_text(
+                f"Сначала пришли данные SKU.\n{reason}\n\nЖми “Шаблон SKU”.",
+                reply_markup=KB,
+            )
             return
 
         await update.message.chat.send_action(action="typing")
@@ -160,38 +165,34 @@ async def handle_any_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         user_payload = make_user_payload(parsed)
         user_task = action_map[text] + "\n\nДанные:\n" + user_payload
 
-        try:
-            last_err = None
-    for delay in (1, 2, 4, 8):  # 4 попытки
-        try:
-            resp = client.chat.completions.create(
-                model="gpt-4o-mini",
-                messages=[
-                    {"role": "system", "content": SYSTEM_PROMPT},
-                    {"role": "user", "content": user_task},
-                ],
-                temperature=0.2,
-            )
-            answer = resp.choices[0].message.content
-            await update.message.reply_text(answer, reply_markup=KB)
-            return
-        except Exception as e:
-            last_err = e
-            # если это 429 — подождём и повторим
-            if "429" in str(e) or "rate limit" in str(e).lower() or "insufficient_quota" in str(e).lower():
-                time.sleep(delay)
-                continue
-            # другая ошибка — сразу покажем
-            await update.message.reply_text(f"Ошибка OpenAI: {e}", reply_markup=KB)
-            return
+        last_err = None
+        for delay in (1, 2, 4, 8):
+            try:
+                resp = client.chat.completions.create(
+                    model="gpt-4o-mini",
+                    messages=[
+                        {"role": "system", "content": SYSTEM_PROMPT},
+                        {"role": "user", "content": user_task},
+                    ],
+                    temperature=0.2,
+                )
+                answer = resp.choices[0].message.content
+                await update.message.reply_text(answer, reply_markup=KB)
+                return
 
-    await update.message.reply_text(f"Ошибка OpenAI (после повторов): {last_err}", reply_markup=KB)
-    return
-        except Exception as e:
-            await update.message.reply_text(f"Ошибка OpenAI: {e}", reply_markup=KB)
+            except Exception as e:
+                last_err = e
+                err = str(e).lower()
+                if "429" in err or "rate limit" in err or "insufficient_quota" in err:
+                    time.sleep(delay)
+                    continue
+
+                await update.message.reply_text(f"Ошибка OpenAI: {e}", reply_markup=KB)
+                return
+
+        await update.message.reply_text(f"Ошибка OpenAI (после повторов): {last_err}", reply_markup=KB)
         return
 
-    # если просто текст — объясним что делать
     await update.message.reply_text("Вставь блок SKU (как в шаблоне) или жми кнопки 👇", reply_markup=KB)
 
 def main():
@@ -202,3 +203,5 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+
