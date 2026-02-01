@@ -162,31 +162,31 @@ async def handle_any_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         try:
             last_err = None
-for delay in (1, 2, 4, 8):  # 4 попытки
-    try:
-        resp = client.chat.completions.create(
-            model="gpt-4o-mini",
-            messages=[
-                {"role": "system", "content": SYSTEM_PROMPT},
-                {"role": "user", "content": user_task},
-            ],
-            temperature=0.2,
-        )
-        answer = resp.choices[0].message.content
-        await update.message.reply_text(answer, reply_markup=KB)
-        return
-    except Exception as e:
-        last_err = e
-        # если это 429 — подождём и повторим
-        if "429" in str(e) or "rate limit" in str(e).lower() or "insufficient_quota" in str(e).lower():
-            time.sleep(delay)
-            continue
-        # другая ошибка — сразу покажем
-        await update.message.reply_text(f"Ошибка OpenAI: {e}", reply_markup=KB)
-        return
+    for delay in (1, 2, 4, 8):  # 4 попытки
+        try:
+            resp = client.chat.completions.create(
+                model="gpt-4o-mini",
+                messages=[
+                    {"role": "system", "content": SYSTEM_PROMPT},
+                    {"role": "user", "content": user_task},
+                ],
+                temperature=0.2,
+            )
+            answer = resp.choices[0].message.content
+            await update.message.reply_text(answer, reply_markup=KB)
+            return
+        except Exception as e:
+            last_err = e
+            # если это 429 — подождём и повторим
+            if "429" in str(e) or "rate limit" in str(e).lower() or "insufficient_quota" in str(e).lower():
+                time.sleep(delay)
+                continue
+            # другая ошибка — сразу покажем
+            await update.message.reply_text(f"Ошибка OpenAI: {e}", reply_markup=KB)
+            return
 
-await update.message.reply_text(f"Ошибка OpenAI (после повторов): {last_err}", reply_markup=KB)
-return
+    await update.message.reply_text(f"Ошибка OpenAI (после повторов): {last_err}", reply_markup=KB)
+    return
         except Exception as e:
             await update.message.reply_text(f"Ошибка OpenAI: {e}", reply_markup=KB)
         return
