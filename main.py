@@ -10,14 +10,13 @@ import pandas as pd
 from telegram import Update, ReplyKeyboardMarkup
 from telegram.ext import Application, CommandHandler, MessageHandler, ContextTypes, filters
 
-
 # ========= НАСТРОЙКИ =========
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 DB_PATH = os.getenv("DB_PATH", "bot.db")
 TMP_DIR = Path(os.getenv("TMP_DIR", "/tmp"))
 
 if not TELEGRAM_BOT_TOKEN:
-    raise RuntimeError("Нет TELEGRAM_BOT_TOKEN. Добавь переменную окружения TELEGRAM_BOT_TOKEN в Railway.")
+    raise RuntimeError("Нет TELEGRAM_BOT_TOKEN. Добавь переменную окружения TELEGRAM_BOT_TOKEN в Railway.")
 
 TMP_DIR.mkdir(parents=True, exist_ok=True)
 
