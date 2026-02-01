@@ -238,6 +238,11 @@ def top_lines(series: pd.Series | None, n: int = 5, ascending: bool = False) -> 
 
 # ========= BOT =========
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    from telegram import ReplyKeyboardRemove
+    await update.message.reply_text(
+        "Обновляю меню…",
+        reply_markup=ReplyKeyboardRemove()
+    )
     context.user_data.clear()
     await update.message.reply_text(
         "Привет 👋\n\n"
