@@ -1,533 +1,601 @@
 import os
+import io
 import re
-import sqlite3
-from datetime import datetime
+import json
+import asyncio
+from dataclasses import dataclass
 from pathlib import Path
+from typing import Optional, Dict, Any, Tuple, List
 
-from openpyxl import load_workbook
-
-from telegram import Update, ReplyKeyboardMarkup
-from telegram.ext import Application, CommandHandler, MessageHandler, ContextTypes, filters
-
-
-# ========= НАСТРОЙКИ =========
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
-DB_PATH = os.getenv("DB_PATH", "bot.db")
-TMP_DIR = Path(os.getenv("TMP_DIR", "/tmp"))
-
-if not TELEGRAM_BOT_TOKEN:
-    raise RuntimeError("Нет TELEGRAM_BOT_TOKEN. Добавь переменную окружения TELEGRAM_BOT_TOKEN в Railway.")
-
-TMP_DIR.mkdir(parents=True, exist_ok=True)
+import pandas as pd
+from aiogram import Bot, Dispatcher, F
+from aiogram.types import Message
+from aiogram.filters import CommandStart, Command
+from openai import OpenAI
 
 
-# ========= КНОПКИ =========
-MAIN_KB = ReplyKeyboardMarkup(
-    keyboard=[
-        ["📈 Прибыль за период"],
-        ["📦 Загрузить себестоимость (SKU → ₽)"],
-        ["⬅️ В меню"],
-    ],
-    resize_keyboard=True
-)
+# =========================
+# ENV / CONFIG
+# =========================
+BOT_TOKEN = os.environ["BOT_TOKEN"]
+OPENAI_API_KEY = os.environ["OPENAI_API_KEY"]
+OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-5.2")
 
-MODE_KB = ReplyKeyboardMarkup(
-    keyboard=[
-        ["🟡 Деньги от OZON"],
-        ["🟢 Чистая прибыль"],
-        ["⬅️ В меню"],
-    ],
-    resize_keyboard=True
-)
+# defaults from env; can be changed via Telegram commands
+TAX_RATE_DEFAULT = float(os.getenv("TAX_RATE", "0.06"))      # e.g. 0.06
+COST_DEFAULT_ENV = float(os.getenv("COST_PER_UNIT", "4000")) # default cost if SKU cost not set
 
-BACK_TO_MENU_KB = ReplyKeyboardMarkup(
-    keyboard=[
-        ["⬅️ В меню"],
-    ],
-    resize_keyboard=True
-)
+client = OpenAI(api_key=OPENAI_API_KEY)
+
+# Runtime settings (changeable)
+RUNTIME_TAX_RATE = TAX_RATE_DEFAULT
+RUNTIME_COST_DEFAULT = COST_DEFAULT_ENV
+
+# Persistent storage
+COSTS_PATH = Path("costs.json")      # stores default cost + per-sku costs
+OPS_MAP_PATH = Path("ops_map.json")  # stores op->kind mapping ("sale"/"return"/"other")
+
+SKU_COSTS: Dict[str, float] = {}     # sku -> cost
+OPS_MAP: Dict[str, str] = {}         # op_value -> "sale" | "return" | "other"
 
 
-# ========= SQLITE =========
-def db():
-    return sqlite3.connect(DB_PATH)
-
-def init_db():
-    with db() as conn:
-        conn.execute("""
-        CREATE TABLE IF NOT EXISTS cogs (
-            tg_id INTEGER NOT NULL,
-            sku TEXT NOT NULL,
-            cogs REAL NOT NULL,
-            updated_at TEXT NOT NULL,
-            PRIMARY KEY (tg_id, sku)
-        )
-        """)
-        conn.execute("""
-        CREATE TABLE IF NOT EXISTS profit_reports (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            tg_id INTEGER NOT NULL,
-            mode TEXT NOT NULL,
-            file_name TEXT NOT NULL,
-            revenue REAL NOT NULL,
-            deductions REAL NOT NULL,
-            net_mp REAL NOT NULL,
-            cogs_total REAL,
-            net_profit REAL,
-            margin REAL,
-            created_at TEXT NOT NULL,
-            note TEXT
-        )
-        """)
-
-def upsert_cogs(tg_id: int, sku: str, cogs_val: float):
-    with db() as conn:
-        conn.execute(
-            "INSERT INTO cogs(tg_id, sku, cogs, updated_at) VALUES(?,?,?,?) "
-            "ON CONFLICT(tg_id, sku) DO UPDATE SET cogs=excluded.cogs, updated_at=excluded.updated_at",
-            (tg_id, sku, float(cogs_val), datetime.utcnow().strftime("%Y-%m-%d"))
-        )
-
-def get_cogs_map(tg_id: int) -> dict:
-    with db() as conn:
-        rows = conn.execute("SELECT sku, cogs FROM cogs WHERE tg_id=?", (tg_id,)).fetchall()
-    return {r[0]: float(r[1]) for r in rows}
-
-def save_report(tg_id: int, payload: dict):
-    with db() as conn:
-        conn.execute("""
-        INSERT INTO profit_reports(
-            tg_id, mode, file_name, revenue, deductions, net_mp,
-            cogs_total, net_profit, margin, created_at, note
-        ) VALUES (?,?,?,?,?,?,?,?,?,?,?)
-        """, (
-            tg_id,
-            payload["mode"],
-            payload["file_name"],
-            float(payload["revenue"]),
-            float(payload["deductions"]),
-            float(payload["net_mp"]),
-            payload.get("cogs_total"),
-            payload.get("net_profit"),
-            payload.get("margin"),
-            datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S"),
-            payload.get("note", ""),
-        ))
+def load_costs():
+    global SKU_COSTS, RUNTIME_COST_DEFAULT
+    if COSTS_PATH.exists():
+        try:
+            data = json.loads(COSTS_PATH.read_text(encoding="utf-8"))
+            RUNTIME_COST_DEFAULT = float(data.get("default_cost", RUNTIME_COST_DEFAULT))
+            raw = data.get("sku_costs", {})
+            SKU_COSTS = {str(k): float(v) for k, v in raw.items()}
+        except Exception:
+            SKU_COSTS = {}
 
 
-# ========= УТИЛИТЫ =========
-def money(x: float) -> str:
-    if x is None:
-        return "0 ₽"
-    if abs(x - int(x)) < 1e-9:
-        return f"{int(x)} ₽"
-    return f"{x:.2f} ₽"
+def save_costs():
+    payload = {"default_cost": RUNTIME_COST_DEFAULT, "sku_costs": SKU_COSTS}
+    COSTS_PATH.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
 
-def pct(x: float) -> str:
-    return f"{x:.2f}%"
 
-def norm(s: str) -> str:
-    return re.sub(r"\s+", " ", str(s)).strip().lower()
+def load_ops_map():
+    global OPS_MAP
+    if OPS_MAP_PATH.exists():
+        try:
+            OPS_MAP = json.loads(OPS_MAP_PATH.read_text(encoding="utf-8"))
+        except Exception:
+            OPS_MAP = {}
 
-def parse_number(x):
-    if x is None:
-        return None
-    s = str(x).replace("\u00A0", "").replace(" ", "").replace(",", ".").strip()
-    m = re.search(r"-?\d+(?:\.\d+)?", s)
-    if not m:
-        return None
+
+def save_ops_map():
+    OPS_MAP_PATH.write_text(json.dumps(OPS_MAP, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+# =========================
+# Column mapping
+# =========================
+def _norm(s: str) -> str:
+    s = str(s).strip().lower()
+    s = re.sub(r"\s+", " ", s)
+    s = s.replace("ё", "е")
+    return s
+
+
+def _find_col_fuzzy(columns, needles):
+    cols = list(columns)
+    ncols = [_norm(c) for c in cols]
+    for nd in needles:
+        ndn = _norm(nd)
+        for c, cn in zip(cols, ncols):
+            if ndn in cn:
+                return c
+    return None
+
+
+@dataclass
+class ColMap:
+    sku: str
+    amount: str
+    qty: Optional[str] = None
+    op: Optional[str] = None
+
+
+def guess_columns_locally(df: pd.DataFrame) -> Optional[ColMap]:
+    sku = _find_col_fuzzy(df.columns, ["sku", "артикул", "offer id", "id товара", "код товара"])
+    amount = _find_col_fuzzy(df.columns, ["сумма итого", "итого, руб", "сумма итого, руб", "сумма, руб"])
+    qty = _find_col_fuzzy(df.columns, ["количество", "шт"])
+    op = _find_col_fuzzy(df.columns, ["операция", "тип начисления", "тип операции", "событие", "начисление"])
+    if sku and amount:
+        return ColMap(sku=sku, amount=amount, qty=qty, op=op)
+    return None
+
+
+async def guess_columns_with_openai(columns: List[str], sample_rows: List[dict]) -> Optional[ColMap]:
+    schema = {
+        "name": "ozon_accruals_column_map",
+        "schema": {
+            "type": "object",
+            "additionalProperties": False,
+            "properties": {
+                "sku": {"type": "string"},
+                "amount": {"type": "string"},
+                "qty": {"type": ["string", "null"]},
+                "op": {"type": ["string", "null"]},
+            },
+            "required": ["sku", "amount", "qty", "op"],
+        },
+        "strict": True,
+    }
+
+    prompt = f"""
+Ты помогаешь парсить XLSX отчет OZON Seller "Начисления".
+Нужно вернуть JSON с точными названиями колонок:
+- sku: колонка SKU/артикул/offer_id/код товара
+- amount: колонка "Сумма итого, руб." (это деньги продавцу по строке)
+- qty: колонка количества (если есть)
+- op: колонка типа операции/начисления (если есть)
+Если qty или op нет — верни null.
+
+Колонки: {columns}
+Примеры строк: {sample_rows}
+
+Верни только JSON по схеме.
+""".strip()
+
     try:
-        return float(m.group(0))
+        resp = client.responses.create(
+            model=OPENAI_MODEL,
+            input=prompt,
+            text={"format": {"type": "json_schema", "json_schema": schema}},
+        )
+        data = resp.output[0].content[0].parsed
+        if data and data.get("sku") and data.get("amount"):
+            return ColMap(sku=data["sku"], amount=data["amount"], qty=data.get("qty"), op=data.get("op"))
     except Exception:
         return None
 
-
-# ========= ЧТЕНИЕ XLSX =========
-def load_xlsx_rows(path: str):
-    wb = load_workbook(path, data_only=True)
-    ws = wb.active
-    rows = list(ws.iter_rows(values_only=True))
-    if not rows or len(rows) < 2:
-        raise ValueError("Файл пустой или без данных.")
-    header = [str(h).strip() if h is not None else "" for h in rows[0]]
-    data = rows[1:]
-    return header, data
-
-def find_col_index(header, keywords):
-    for i, col in enumerate(header):
-        nc = norm(col)
-        for kw in keywords:
-            if kw in nc:
-                return i
     return None
 
-def parse_report_xlsx(path: str):
-    header, data = load_xlsx_rows(path)
 
-    amount_idx = find_col_index(header, ["итого"])
-    if amount_idx is None:
-        amount_idx = find_col_index(header, ["сумм", "начисл", "amount"])
-
-    if amount_idx is None:
-        # запасной вариант: ищем колонку с наибольшим количеством чисел
-        best_i, best_score = None, 0
-        for i in range(len(header)):
-            score = 0
-            for r in data[:2000]:
-                v = parse_number(r[i] if i < len(r) else None)
-                if v is not None:
-                    score += 1
-            if score > best_score:
-                best_score = score
-                best_i = i
-        amount_idx = best_i
-
-    if amount_idx is None:
-        raise ValueError("Не нашёл колонку с суммой/итого.")
-
-    sku_idx = find_col_index(header, ["sku", "offer", "артикул"])
-    qty_idx = find_col_index(header, ["кол", "quantity", "qty"])
-
-    revenue = 0.0
-    deductions = 0.0
-    total = 0.0
-
-    by_sku_amount = {}
-
-    for r in data:
-        if amount_idx >= len(r):
-            continue
-        amt = parse_number(r[amount_idx])
-        if amt is None:
-            continue
-
-        total += amt
-        if amt > 0:
-            revenue += amt
-        elif amt < 0:
-            deductions += amt
-
-        sku = ""
-        if sku_idx is not None and sku_idx < len(r):
-            sku = str(r[sku_idx]).strip() if r[sku_idx] is not None else ""
-
-        if sku:
-            by_sku_amount[sku] = by_sku_amount.get(sku, 0.0) + amt
-
-    note = f"amount_col_idx={amount_idx} | sku_idx={sku_idx if sku_idx is not None else 'NOT_FOUND'} | qty_idx={qty_idx if qty_idx is not None else 'NOT_FOUND'}"
-    return {
-        "revenue": float(revenue),
-        "deductions": float(deductions),
-        "total": float(total),
-        "by_sku_amount": by_sku_amount,
-        "note": note,
-        "header": header,
-        "amount_idx": amount_idx,
-        "sku_idx": sku_idx,
-        "qty_idx": qty_idx,
-        "data": data,
+# =========================
+# OpenAI op classification (context-based)
+# =========================
+async def classify_operations_with_openai(op_samples: list[dict]) -> dict[str, str]:
+    """
+    op_samples: [
+      {"op": "Название операции", "examples": [{"sku": "...", "amount": 123.45}, ...]},
+      ...
+    ]
+    Returns mapping: op -> 'sale' | 'return' | 'other'
+    """
+    schema = {
+        "name": "ozon_ops_classifier",
+        "schema": {
+            "type": "object",
+            "additionalProperties": False,
+            "properties": {
+                "mapping": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "additionalProperties": False,
+                        "properties": {
+                            "op": {"type": "string"},
+                            "kind": {"type": "string", "enum": ["sale", "return", "other"]},
+                            "confidence": {"type": "number", "minimum": 0, "maximum": 1},
+                        },
+                        "required": ["op", "kind", "confidence"],
+                    },
+                }
+            },
+            "required": ["mapping"],
+        },
+        "strict": True,
     }
 
-def top_lines_dict(d: dict, n=5, ascending=False):
-    if not d:
-        return "нет данных"
-    items = sorted(d.items(), key=lambda x: x[1], reverse=not ascending)[:n]
-    return "\n".join([f"{k} — {money(float(v))}" for k, v in items])
+    prompt = f"""
+Ты — бухгалтер/аналитик по OZON.
+Даны операции из отчёта "Начисления" и примеры строк по каждой операции (SKU и "Сумма итого, руб.").
 
-def parse_cogs_xlsx(path: str):
-    header, data = load_xlsx_rows(path)
+Определи для каждой операции:
+- sale: продажа/реализация товара покупателю
+- return: возврат/отмена/аннулирование продажи
+- other: логистика, комиссия, услуги, штрафы, корректировки, продвижение и т.д.
 
-    sku_idx = find_col_index(header, ["sku", "артикул", "offer"])
-    cogs_idx = find_col_index(header, ["cogs", "себест", "себестоим", "cost"])
+Оценивай по смыслу и примерам начислений, не по ключевым словам.
+Верни только JSON по схеме.
 
-    if sku_idx is None or cogs_idx is None:
-        raise ValueError("В файле себестоимости нужны колонки: sku и cogs (или 'артикул' и 'себестоимость').")
+Данные:
+{op_samples}
+""".strip()
 
-    rows = []
-    for r in data:
-        if sku_idx >= len(r) or cogs_idx >= len(r):
-            continue
-        sku = str(r[sku_idx]).strip() if r[sku_idx] is not None else ""
-        cogs_val = parse_number(r[cogs_idx])
-        if not sku or cogs_val is None:
-            continue
-        rows.append((sku, float(cogs_val)))
-    return rows
+    resp = client.responses.create(
+        model=OPENAI_MODEL,
+        input=prompt,
+        text={"format": {"type": "json_schema", "json_schema": schema}},
+    )
+    parsed = resp.output[0].content[0].parsed
+    out = {}
+    for item in parsed["mapping"]:
+        out[str(item["op"])] = item["kind"]
+    return out
 
 
-# ========= BOT =========
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data.clear()
-    await update.message.reply_text(
-        "Привет 👋\n\n"
-        "Я считаю прибыль по отчёту OZON «Начисления».\n"
-        "✅ Формат файлов: ТОЛЬКО Excel (.xlsx)\n\n"
-        "Выбери действие ⬇️",
-        reply_markup=MAIN_KB
+# =========================
+# Core calc (video method)
+# =========================
+def _to_number_series(s: pd.Series) -> pd.Series:
+    return pd.to_numeric(
+        s.astype(str)
+         .str.replace("\u00a0", "", regex=False)
+         .str.replace(" ", "", regex=False)
+         .str.replace(",", ".", regex=False),
+        errors="coerce"
+    ).fillna(0.0)
+
+
+def compute_video_method(
+    df: pd.DataFrame,
+    colmap: ColMap,
+    default_cost_per_unit: float,
+    sku_costs: Dict[str, float],
+    tax_rate: float
+) -> Dict[str, Any]:
+    work = df.copy()
+    work = work.dropna(how="all")
+
+    # normalize key fields
+    work[colmap.sku] = work[colmap.sku].fillna("").astype(str).str.strip()
+    work[colmap.amount] = _to_number_series(work[colmap.amount])
+
+    # revenue = sum(amount)
+    revenue_total = float(work[colmap.amount].sum())
+    tax_total = max(revenue_total, 0.0) * tax_rate  # video method: tax from revenue (accruals)
+
+    # qty per row:
+    # 1) if qty exists -> use it AND try to sign it by op mapping if op exists
+    # 2) else if op exists -> sale=+1, return=-1, other=0 using OPS_MAP
+    # 3) else -> qty=0 (cannot compute COGS)
+    work["_row_qty"] = 0.0
+
+    has_qty = bool(colmap.qty and colmap.qty in work.columns)
+    has_op = bool(colmap.op and colmap.op in work.columns)
+
+    if has_qty:
+        work[colmap.qty] = _to_number_series(work[colmap.qty])
+
+        if has_op:
+            def _signed_qty(row) -> float:
+                opv = str(row[colmap.op]).strip()
+                kind = OPS_MAP.get(opv, "other")
+                q = float(row[colmap.qty])
+                if kind == "sale":
+                    return abs(q) if q != 0 else 1.0
+                if kind == "return":
+                    return -abs(q) if q != 0 else -1.0
+                return 0.0
+
+            work["_row_qty"] = work.apply(_signed_qty, axis=1)
+        else:
+            work["_row_qty"] = work[colmap.qty]
+
+    elif has_op:
+        def _qty_from_op(opv: str) -> float:
+            kind = OPS_MAP.get(str(opv).strip(), "other")
+            if kind == "sale":
+                return 1.0
+            if kind == "return":
+                return -1.0
+            return 0.0
+
+        work["_row_qty"] = work[colmap.op].apply(_qty_from_op).astype(float)
+
+    else:
+        work["_row_qty"] = 0.0
+
+    # sold qty used for COGS = only sales rows (positive qty)
+    sku_qty_sales = (
+        work.loc[work["_row_qty"] > 0]
+            .groupby(colmap.sku)["_row_qty"]
+            .sum()
+            .to_dict()
+    )
+    sold_qty_total = float(sum(sku_qty_sales.values()))
+
+    # Per SKU revenue
+    sku_rev = work.groupby(colmap.sku, dropna=False)[colmap.amount].sum().to_dict()
+
+    def cost_for_sku(sku: str) -> float:
+        return float(sku_costs.get(str(sku), default_cost_per_unit))
+
+    # COGS per SKU (by sales count only)
+    sku_cogs = {}
+    cogs_total = 0.0
+    for sku in sku_rev.keys():
+        qty = float(sku_qty_sales.get(sku, 0.0))
+        c = qty * cost_for_sku(sku)
+        sku_cogs[sku] = c
+        cogs_total += c
+
+    # Allocate tax proportionally to positive revenue SKUs
+    pos_rev_sum = sum(v for v in sku_rev.values() if float(v) > 0)
+    sku_tax = {}
+    for sku, rev in sku_rev.items():
+        rev = float(rev)
+        if rev > 0 and pos_rev_sum > 0:
+            sku_tax[sku] = tax_total * (rev / pos_rev_sum)
+        else:
+            sku_tax[sku] = 0.0
+
+    # Profit per SKU
+    sku_profit = {}
+    for sku in sku_rev.keys():
+        sku_profit[sku] = float(sku_rev[sku]) - float(sku_cogs.get(sku, 0.0)) - float(sku_tax.get(sku, 0.0))
+
+    profit_total = revenue_total - cogs_total - tax_total
+
+    def r2(x): return float(round(float(x), 2))
+
+    result = {
+        "revenue_total": r2(revenue_total),
+        "tax_total": r2(tax_total),
+        "cogs_total": r2(cogs_total),
+        "profit_total": r2(profit_total),
+        "sold_qty_total": r2(sold_qty_total),
+        "warning_no_qty": not (has_qty or has_op),
+        "per_sku": []
+    }
+
+    for sku, rev in sorted(sku_rev.items(), key=lambda x: float(x[1]), reverse=True):
+        sku_str = str(sku).strip()
+        result["per_sku"].append({
+            "sku": sku_str,
+            "revenue": r2(rev),
+            "sold_qty": r2(sku_qty_sales.get(sku_str, sku_qty_sales.get(sku, 0.0))),
+            "cogs": r2(sku_cogs.get(sku_str, sku_cogs.get(sku, 0.0))),
+            "tax": r2(sku_tax.get(sku_str, sku_tax.get(sku, 0.0))),
+            "profit": r2(sku_profit.get(sku_str, sku_profit.get(sku, 0.0))),
+        })
+
+    return result
+
+
+def format_answer(res: Dict[str, Any]) -> str:
+    lines = []
+    lines.append(f"1) Общая выручка (на р/с): {res['revenue_total']:.2f} ₽")
+    lines.append(f"2) Общая чистая прибыль: {res['profit_total']:.2f} ₽")
+    lines.append("3) По SKU:")
+    for item in res["per_sku"]:
+        lines.append(f"- {item['sku']}: выручка {item['revenue']:.2f} ₽, чистая прибыль {item['profit']:.2f} ₽")
+
+    if res.get("warning_no_qty"):
+        lines.append("")
+        lines.append("⚠️ Не найдена колонка количества и колонка операции. Себестоимость не посчиталась.")
+        lines.append("Пришли именно XLSX отчет OZON «Начисления» (полный).")
+
+    return "\n".join(lines)
+
+
+# =========================
+# Telegram commands: costs
+# =========================
+def _parse_money(x: str) -> float:
+    return float(str(x).replace(" ", "").replace("\u00a0", "").replace(",", "."))
+
+
+async def cmd_costdefault(msg: Message):
+    global RUNTIME_COST_DEFAULT
+    parts = msg.text.strip().split()
+
+    if len(parts) == 1:
+        await msg.answer(
+            f"Себестоимость по умолчанию: {RUNTIME_COST_DEFAULT:.2f} ₽\n"
+            f"Установить: /costdefault 4000"
+        )
+        return
+
+    try:
+        val = _parse_money(parts[1])
+        if val <= 0 or val > 10_000_000:
+            await msg.answer("Некорректное значение. Пример: /costdefault 4000")
+            return
+        RUNTIME_COST_DEFAULT = val
+        save_costs()
+        await msg.answer(f"Готово. Себестоимость по умолчанию: {RUNTIME_COST_DEFAULT:.2f} ₽")
+    except Exception:
+        await msg.answer("Не понял число. Пример: /costdefault 4000")
+
+
+async def cmd_costsku(msg: Message):
+    parts = msg.text.strip().split()
+
+    # /costsku -> list
+    if len(parts) == 1:
+        if not SKU_COSTS:
+            await msg.answer(
+                "Себестоимости по SKU не заданы.\n"
+                "Задать: /costsku 2796688793 4200\n"
+                f"По умолчанию: {RUNTIME_COST_DEFAULT:.2f} ₽ (/costdefault)"
+            )
+            return
+        lines = ["Себестоимость по SKU:"]
+        for k, v in sorted(SKU_COSTS.items(), key=lambda x: x[0]):
+            lines.append(f"- {k}: {v:.2f} ₽")
+        await msg.answer("\n".join(lines))
+        return
+
+    # /costsku <sku> -> show one
+    if len(parts) == 2:
+        sku = str(parts[1]).strip()
+        val = SKU_COSTS.get(sku)
+        if val is None:
+            await msg.answer(
+                f"Для SKU {sku} себестоимость не задана.\n"
+                f"Будет использовано default: {RUNTIME_COST_DEFAULT:.2f} ₽\n"
+                f"Задать: /costsku {sku} 4200"
+            )
+        else:
+            await msg.answer(f"SKU {sku}: себестоимость {val:.2f} ₽")
+        return
+
+    # /costsku <sku> <cost> -> set
+    try:
+        sku = str(parts[1]).strip()
+        val = _parse_money(parts[2])
+        if val <= 0 or val > 10_000_000:
+            await msg.answer("Некорректно. Пример: /costsku 2796688793 4200")
+            return
+        SKU_COSTS[sku] = val
+        save_costs()
+        await msg.answer(f"Готово. SKU {sku}: себестоимость {val:.2f} ₽")
+    except Exception:
+        await msg.answer("Формат: /costsku <SKU> <себестоимость>. Пример: /costsku 2796688793 4200")
+
+
+async def cmd_costsku_del(msg: Message):
+    parts = msg.text.strip().split()
+    if len(parts) != 2:
+        await msg.answer("Формат: /costsku_del <SKU>. Пример: /costsku_del 2796688793")
+        return
+
+    sku = str(parts[1]).strip()
+    if sku in SKU_COSTS:
+        SKU_COSTS.pop(sku, None)
+        save_costs()
+        await msg.answer(
+            f"Удалил себестоимость SKU {sku}. Теперь используется default: {RUNTIME_COST_DEFAULT:.2f} ₽"
+        )
+    else:
+        await msg.answer(f"Для SKU {sku} себестоимость не была задана.")
+
+
+# =========================
+# Telegram handlers
+# =========================
+async def start(msg: Message):
+    await msg.answer(
+        "Скинь XLSX отчет OZON «Начисления».\n"
+        "Посчитаю по методике из видео:\n"
+        "1) выручка (на р/с)\n"
+        "2) чистая прибыль\n"
+        "3) по каждому SKU (выручка и чистая прибыль)\n\n"
+        "Себестоимость:\n"
+        "- /costdefault 4000\n"
+        "- /costsku <SKU> <COST>"
     )
 
-async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = (update.message.text or "").strip()
-    print("TEXT:", repr(text), "STATE:", dict(context.user_data))
 
-    # кнопки — в начале
-    if text == "⬅️ В меню":
-        context.user_data.clear()
-        await update.message.reply_text("Меню ⬇️", reply_markup=MAIN_KB)
-        return
+async def read_xlsx_from_bytes(b: bytes) -> pd.DataFrame:
+    return pd.read_excel(io.BytesIO(b), engine="openpyxl")
 
-    if text == "📈 Прибыль за период":
-        context.user_data.clear()
-        await update.message.reply_text(
-            "Как считать?\n\n"
-            "🟡 Деньги от OZON — итог по отчёту (в плюсе/в минусе)\n"
-            "🟢 Чистая прибыль — нужна себестоимость SKU → ₽\n\n"
-            "Пришли .xlsx файл после выбора режима ⬇️",
-            reply_markup=MODE_KB
+
+async def handle_xlsx_bytes(file_bytes: bytes) -> Tuple[Optional[str], Optional[str]]:
+    try:
+        df = await read_xlsx_from_bytes(file_bytes)
+        df = df.dropna(how="all")
+
+        # 1) local guess
+        colmap = guess_columns_locally(df)
+
+        # 2) fallback to OpenAI
+        if colmap is None:
+            cols = list(map(str, df.columns.tolist()))
+            sample = df.head(10).fillna("").to_dict(orient="records")
+            colmap = await guess_columns_with_openai(cols, sample)
+
+        if colmap is None:
+            return None, "Не смог распознать колонки (SKU / Сумма итого). Проверь, что это XLSX отчет 'Начисления'."
+
+        # ---- Context-based operation mapping (sale/return/other) ----
+        if colmap.op and colmap.op in df.columns:
+            tmp = df.copy()
+            tmp[colmap.amount] = _to_number_series(tmp[colmap.amount])
+            tmp[colmap.op] = tmp[colmap.op].fillna("").astype(str).str.strip()
+            tmp[colmap.sku] = tmp[colmap.sku].fillna("").astype(str).str.strip()
+
+            unique_ops = tmp[colmap.op].loc[lambda s: s != ""].unique().tolist()
+            missing = [op for op in unique_ops if op not in OPS_MAP]
+
+            if missing:
+                MAX_EXAMPLES_PER_OP = 4
+                MAX_OPS_PER_CALL = 40
+
+                op_samples_all = []
+                for op in missing:
+                    sub = tmp[tmp[colmap.op] == op][[colmap.sku, colmap.amount]].copy()
+
+                    # prefer non-zero examples
+                    sub_nz = sub[sub[colmap.amount] != 0].head(MAX_EXAMPLES_PER_OP)
+                    if len(sub_nz) < MAX_EXAMPLES_PER_OP:
+                        sub_any = sub.head(MAX_EXAMPLES_PER_OP - len(sub_nz))
+                        sub_use = pd.concat([sub_nz, sub_any], ignore_index=True)
+                    else:
+                        sub_use = sub_nz
+
+                    examples = []
+                    for _, row in sub_use.iterrows():
+                        examples.append({"sku": str(row[colmap.sku]), "amount": float(row[colmap.amount])})
+
+                    op_samples_all.append({"op": str(op), "examples": examples})
+
+                for i in range(0, len(op_samples_all), MAX_OPS_PER_CALL):
+                    chunk = op_samples_all[i:i + MAX_OPS_PER_CALL]
+                    new_map = await classify_operations_with_openai(chunk)
+                    OPS_MAP.update(new_map)
+
+                save_ops_map()
+
+        # ---- Compute ----
+        res = compute_video_method(
+            df,
+            colmap,
+            default_cost_per_unit=RUNTIME_COST_DEFAULT,
+            sku_costs=SKU_COSTS,
+            tax_rate=RUNTIME_TAX_RATE
         )
-        return
 
-    if text == "🟡 Деньги от OZON":
-        context.user_data.clear()
-        context.user_data["mode"] = "mp_money"
-        context.user_data["await_report"] = True
-        await update.message.reply_text(
-            "Ок. Пришли .xlsx отчёт OZON «Начисления» за нужный период.",
-            reply_markup=MODE_KB
-        )
-        return
+        return format_answer(res), None
 
-    if text == "🟢 Чистая прибыль":
-        context.user_data.clear()
-        context.user_data["mode"] = "net_profit"
-        context.user_data["await_report"] = True
-        await update.message.reply_text(
-            "Ок. Пришли .xlsx отчёт OZON «Начисления» за нужный период.\n\n"
-            "Если себестоимость ещё не загружал — сначала загрузи через «📦 Загрузить себестоимость (SKU → ₽)».",
-            reply_markup=MODE_KB
-        )
-        return
+    except Exception as e:
+        return None, f"Ошибка чтения/расчета: {e}"
 
-    if text == "📦 Загрузить себестоимость (SKU → ₽)":
-        context.user_data.clear()
-        context.user_data["await_cogs"] = True
-        await update.message.reply_text(
-            "Пришли Excel (.xlsx) файл себестоимости.\n\n"
-            "В таблице должны быть колонки:\n"
-            "• sku (или Артикул/offer)\n"
-            "• cogs (или Себестоимость)\n\n"
-            "Пример заголовков: sku | cogs",
-            reply_markup=BACK_TO_MENU_KB
-        )
-        return
 
-    # если ждём файл
-    if context.user_data.get("await_report"):
-        await update.message.reply_text("Я жду .xlsx отчёт «Начисления». Пришли документом.", reply_markup=MODE_KB)
-        return
-
-    if context.user_data.get("await_cogs"):
-        await update.message.reply_text("Я жду .xlsx файл себестоимости. Пришли документом.", reply_markup=BACK_TO_MENU_KB)
-        return
-
-    await update.message.reply_text("Выбери действие кнопкой ⬇️", reply_markup=MAIN_KB)
-
-async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    doc = update.message.document
-    tg_id = update.effective_user.id
+async def on_document(msg: Message, bot: Bot):
+    doc = msg.document
     if not doc:
         return
 
-    file_name = doc.file_name or "file"
-    suffix = Path(file_name).suffix.lower()
-    tg_file = await context.bot.get_file(doc.file_id)
-
-    # ТОЛЬКО XLSX
-    if suffix != ".xlsx":
-        await update.message.reply_text("Я принимаю только Excel (.xlsx).", reply_markup=MAIN_KB)
+    if not doc.file_name.lower().endswith(".xlsx"):
+        await msg.answer("Пришли файл в формате .xlsx (CSV не принимаю).")
         return
 
-    # --- себестоимость ---
-    if context.user_data.get("await_cogs"):
-        local_path = str(TMP_DIR / f"cogs_{tg_id}_{int(datetime.utcnow().timestamp())}.xlsx")
-        await tg_file.download_to_drive(custom_path=local_path)
+    tg_file = await bot.get_file(doc.file_id)
+    buf = await bot.download_file(tg_file.file_path)
+    file_bytes = buf.read()
 
-        try:
-            rows = parse_cogs_xlsx(local_path)
-            count = 0
-            for sku, cogs_val in rows:
-                upsert_cogs(tg_id, sku, cogs_val)
-                count += 1
-
-            context.user_data.clear()
-            await update.message.reply_text(f"✅ Загружено себестоимостей: {count} SKU", reply_markup=MAIN_KB)
-        except Exception as e:
-            await update.message.reply_text(f"Ошибка файла себестоимости: {e}", reply_markup=BACK_TO_MENU_KB)
-        return
-
-    # --- отчёт начисления ---
-    if context.user_data.get("await_report"):
-        local_path = str(TMP_DIR / f"report_{tg_id}_{int(datetime.utcnow().timestamp())}.xlsx")
-        await tg_file.download_to_drive(custom_path=local_path)
-
-        mode = context.user_data.get("mode", "mp_money")
-
-        try:
-            parsed = parse_report_xlsx(local_path)
-            revenue = parsed["revenue"]
-            deductions = parsed["deductions"]
-            net_mp = parsed["total"]
-
-            if mode == "mp_money":
-                status = "🟢" if net_mp > 0 else "🔴"
-                msg = (
-                    "📈 Итоги по отчёту OZON «Начисления»\n\n"
-                    f"Начислено (плюс): {money(revenue)}\n"
-                    f"Удержания (минус): {money(deductions)}\n"
-                    f"Итого от OZON: {money(net_mp)}\n"
-                    f"Статус: {status}\n\n"
-                    f"Тех.инфо: {parsed['note']}\n\n"
-                )
-
-                by_sku = parsed["by_sku_amount"]
-                if by_sku:
-                    msg += "ТОП-5 SKU по итогу:\n" + top_lines_dict(by_sku, 5, ascending=False) + "\n\n"
-                    msg += "ТОП-5 SKU в минус:\n" + top_lines_dict(by_sku, 5, ascending=True) + "\n"
-                else:
-                    msg += "ТОП SKU: нет (не нашёл колонку SKU/offer_id/артикул)\n"
-
-                save_report(tg_id, {
-                    "mode": "mp_money",
-                    "file_name": file_name,
-                    "revenue": revenue,
-                    "deductions": deductions,
-                    "net_mp": net_mp,
-                    "note": parsed["note"],
-                })
-
-                context.user_data.clear()
-                await update.message.reply_text(msg, reply_markup=MAIN_KB)
-                return
-
-            # net_profit
-            cogs_map = get_cogs_map(tg_id)
-            if not cogs_map:
-                status = "🟢" if net_mp > 0 else "🔴"
-                msg = (
-                    "🟢 Чистая прибыль\n\n"
-                    "Себестоимость не загружена.\n"
-                    "Показываю деньги от OZON (без себестоимости):\n\n"
-                    f"Итого от OZON: {money(net_mp)}\n"
-                    f"Статус: {status}\n\n"
-                    "Загрузи себестоимость через «📦 Загрузить себестоимость (SKU → ₽)» и повтори расчёт."
-                )
-                save_report(tg_id, {
-                    "mode": "net_profit",
-                    "file_name": file_name,
-                    "revenue": revenue,
-                    "deductions": deductions,
-                    "net_mp": net_mp,
-                    "note": "NO_COGS | " + parsed["note"],
-                })
-                context.user_data.clear()
-                await update.message.reply_text(msg, reply_markup=MAIN_KB)
-                return
-
-            # считаем себестоимость по SKU (qty пока не используем, если нет колонки qty — считаем 1)
-            sku_idx = parsed["sku_idx"]
-            qty_idx = parsed["qty_idx"]
-            data = parsed["data"]
-
-            if sku_idx is None:
-                msg = (
-                    "🟢 Чистая прибыль\n\n"
-                    "В отчёте не нашёл SKU/offer_id/артикул — не могу применить себестоимость.\n"
-                    "Проверь, что в выгрузке есть артикулы."
-                )
-                context.user_data.clear()
-                await update.message.reply_text(msg, reply_markup=MAIN_KB)
-                return
-
-            cogs_total = 0.0
-            by_sku_profit = {}
-
-            for r in data:
-                if sku_idx >= len(r):
-                    continue
-                sku = str(r[sku_idx]).strip() if r[sku_idx] is not None else ""
-                if not sku:
-                    continue
-
-                amt = None
-                if parsed["amount_idx"] < len(r):
-                    amt = parse_number(r[parsed["amount_idx"]])
-                if amt is None:
-                    continue
-
-                qty = 1.0
-                if qty_idx is not None and qty_idx < len(r):
-                    q = parse_number(r[qty_idx])
-                    if q is not None and q > 0:
-                        qty = float(q)
-
-                c = float(cogs_map.get(sku, 0.0)) * qty
-                cogs_total += c
-
-                # прибыль по SKU = сумма начислений по SKU - себестоимость
-                by_sku_profit[sku] = by_sku_profit.get(sku, 0.0) + (amt - c)
-
-            net_profit = net_mp - cogs_total
-            margin = (net_profit / revenue * 100.0) if revenue > 0 else 0.0
-            status = "🔴" if net_profit <= 0 else ("🟡" if margin < 15 else "🟢")
-
-            msg = (
-                "🟢 Чистая прибыль по отчёту OZON «Начисления»\n\n"
-                f"Итого от OZON: {money(net_mp)}\n"
-                f"Себестоимость: {money(cogs_total)}\n\n"
-                f"Чистая прибыль: {money(net_profit)}\n"
-                f"Маржа: {pct(margin)}\n"
-                f"Статус: {status}\n\n"
-                f"Тех.инфо: {parsed['note']}\n\n"
-                "ТОП-5 SKU по прибыли:\n"
-                f"{top_lines_dict(by_sku_profit, 5, ascending=False)}\n\n"
-                "ТОП-5 SKU в минус:\n"
-                f"{top_lines_dict(by_sku_profit, 5, ascending=True)}\n"
-            )
-
-            save_report(tg_id, {
-                "mode": "net_profit",
-                "file_name": file_name,
-                "revenue": revenue,
-                "deductions": deductions,
-                "net_mp": net_mp,
-                "cogs_total": cogs_total,
-                "net_profit": net_profit,
-                "margin": margin,
-                "note": parsed["note"],
-            })
-
-            context.user_data.clear()
-            await update.message.reply_text(msg, reply_markup=MAIN_KB)
-
-        except Exception as e:
-            await update.message.reply_text(
-                f"Не смог разобрать файл 😕\n\nОшибка: {e}\n\n"
-                "Проверь, что это Excel (.xlsx) и это отчёт OZON «Начисления».",
-                reply_markup=MODE_KB
-            )
-        return
-
-    await update.message.reply_text("Я сейчас не жду файл. Нажми «📈 Прибыль за период».", reply_markup=MAIN_KB)
+    answer, error = await handle_xlsx_bytes(file_bytes)
+    if error:
+        await msg.answer(error)
+    else:
+        await msg.answer(answer)
 
 
-def main():
-    init_db()
-    app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(MessageHandler(filters.Document.ALL, handle_document))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
-    app.run_polling()
+# =========================
+# App entry
+# =========================
+async def main():
+    load_costs()
+    load_ops_map()
+
+    bot = Bot(BOT_TOKEN)
+    dp = Dispatcher()
+
+    dp.message.register(start, CommandStart())
+    dp.message.register(cmd_costdefault, Command("costdefault"))
+    dp.message.register(cmd_costsku, Command("costsku"))
+    dp.message.register(cmd_costsku_del, Command("costsku_del"))
+    dp.message.register(on_document, F.document)
+
+    await dp.start_polling(bot)
 
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())
