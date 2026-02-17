@@ -279,15 +279,17 @@ async def image_make(message: Message, state: FSMContext):
 
         await message.answer_photo(out, caption="✅ Готово. Нажми /start чтобы сделать ещё.")
     except Exception as e:
-        # Это пойдёт в Railway Logs
-        print("OPENAI IMAGE ERROR:", repr(e))
+        err = str(e)
+        if "billing_hard_limit" in err or "Billing hard limit" in err:
+            await message.answer(
+                "⚠️ Генерация изображений временно недоступна.\n"
+                "Причина: достигнут лимит оплаты OpenAI (Billing hard limit).\n\n"
+                "Решение: пополнить баланс/подключить оплату в OpenAI Billing."
+            )
+        else:
+            print("OPENAI IMAGE ERROR:", repr(e))
+            await message.answer(f"Не получилось сгенерировать. Ошибка: {type(e).__name__}")
 
-        # Это увидишь в Telegram (безопасно)
-        await message.answer(
-            "Не получилось сгенерировать.\n"
-            "Сейчас посмотрю причину в логах Railway.\n\n"
-            f"Ошибка: {type(e).__name__}"
-        )
 
     finally:
         await state.clear()
