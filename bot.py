@@ -2,12 +2,19 @@ import os
 import base64
 from dataclasses import dataclass
 from typing import Optional
-from PIL import Image
 import io
+import json
+import traceback
 
+from PIL import Image
 from dotenv import load_dotenv
 from aiogram import Bot, Dispatcher, F
-from aiogram.types import Message, CallbackQuery
+from aiogram.types import (
+    Message,
+    CallbackQuery,
+    ReplyKeyboardMarkup,
+    KeyboardButton,
+)
 from aiogram.filters import Command
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
@@ -30,6 +37,9 @@ dp = Dispatcher()
 client = OpenAI(api_key=OPENAI_API_KEY)
 
 
+# ---------------------------
+# FSM states
+# ---------------------------
 class ProfitFlow(StatesGroup):
     cogs = State()
     price = State()
@@ -44,6 +54,15 @@ class ImageFlow(StatesGroup):
     text = State()
 
 
+class DescriptionFlow(StatesGroup):
+    info = State()        # пользователь описывает товар
+    style = State()       # стиль текста (коротко/подробно/премиум)
+    extra = State()       # доп. требования (опционально)
+
+
+# ---------------------------
+# Business logic (math)
+# ---------------------------
 @dataclass
 class ProfitInput:
     cogs: float
@@ -66,38 +85,127 @@ def calc_profit(x: ProfitInput) -> dict:
     return {"commission": commission, "tax": tax, "profit": profit, "margin_pct": margin_pct}
 
 
-def main_menu():
-    kb = InlineKeyboardBuilder()
-    kb.button(text="📊 Рассчитать прибыль (SKU)", callback_data="menu_profit")
-    kb.button(text="🖼 Фото для карточки OZON", callback_data="menu_image")
-    kb.adjust(1)
-    return kb.as_markup()
-
-
-@dp.message(Command("start"))
-async def start(message: Message):
-    await message.answer(
-        "Привет! Я помогу:\n"
-        "1) Посчитать чистую прибыль (точной математикой)\n"
-        "2) Сделать фото для карточки (ИИ)\n\n"
-        "Выбирай 👇",
-        reply_markup=main_menu(),
+# ---------------------------
+# Reply (bottom) menu keyboard — как на 3 скрине
+# ---------------------------
+def bottom_menu_kb() -> ReplyKeyboardMarkup:
+    return ReplyKeyboardMarkup(
+        keyboard=[
+            [KeyboardButton(text="🏠 Главное меню")],
+            [KeyboardButton(text="📊 Посчитать чистую прибыль"), KeyboardButton(text="🖼 Фото для карточки OZON")],
+            [KeyboardButton(text="📝 Создать описание"), KeyboardButton(text="💼 Мои товары")],
+            [KeyboardButton(text="💰 Тарифы")],
+        ],
+        resize_keyboard=True
     )
+
+
+async def show_main_menu(message: Message, state: FSMContext):
+    await state.clear()
+    await message.answer("Главное меню 👇", reply_markup=bottom_menu_kb())
+
+
+# ---------------------------
+# OpenAI error logging helpers
+# ---------------------------
+def log_openai_error(context: dict, e: Exception):
+    """
+    Печатает в Railway Logs максимально понятную диагностику.
+    """
+    payload = {
+        "tag": "OPENAI_ERROR",
+        "context": context,
+        "error_type": type(e).__name__,
+        "error_str": str(e),
+        "traceback": traceback.format_exc(limit=6),
+    }
+    print("OPENAI ERROR CONTEXT:", json.dumps(payload, ensure_ascii=False))
+
+
+def classify_openai_error_message(err: str) -> str:
+    """
+    Человеческая классификация — что сказать пользователю.
+    """
+    low = err.lower()
+
+    if "billing_hard_limit" in low or "hard limit" in low:
+        return "billing_limit"
+    if "incorrect api key" in low or "invalid_api_key" in low or "api key" in low and "invalid" in low:
+        return "invalid_key"
+    if "rate limit" in low or "rate_limit" in low:
+        return "rate_limit"
+    if "quota" in low and "exceeded" in low:
+        return "quota"
+    if "bad request" in low or "error code: 400" in low:
+        return "bad_request"
+    if "error code: 401" in low:
+        return "unauthorized"
+    if "error code: 403" in low:
+        return "forbidden"
+    if "error code: 413" in low or "too large" in low:
+        return "too_large"
+    if "timeout" in low or "timed out" in low:
+        return "timeout"
+    return "unknown"
+
+
+def user_friendly_error_text(kind: str) -> str:
+    if kind == "billing_limit":
+        return (
+            "⚠️ Генерация временно недоступна.\n"
+            "Причина: достигнут лимит оплаты OpenAI (Billing hard limit).\n\n"
+            "Решение: пополнить баланс/подключить оплату в OpenAI Billing."
+        )
+    if kind == "invalid_key":
+        return (
+            "⚠️ Ошибка ключа OpenAI.\n"
+            "Проверь переменную OPENAI_API_KEY в Railway → Variables.\n"
+            "После изменения сделай Redeploy."
+        )
+    if kind in ("rate_limit", "timeout"):
+        return (
+            "⚠️ Временная перегрузка/лимит запросов.\n"
+            "Попробуй ещё раз через минуту."
+        )
+    if kind == "too_large":
+        return (
+            "⚠️ Фото слишком тяжёлое.\n"
+            "Попробуй другое фото или сделай его меньше/проще."
+        )
+    # универсально
+    return (
+        "⚠️ Не получилось выполнить запрос к OpenAI.\n"
+        "Я записал причину в логи Railway (Logs)."
+    )
+
+
+# ---------------------------
+# /start & main menu
+# ---------------------------
+@dp.message(Command("start"))
+async def start(message: Message, state: FSMContext):
+    await show_main_menu(message, state)
+
+
+@dp.message(F.text == "🏠 Главное меню")
+async def go_main_menu(message: Message, state: FSMContext):
+    await show_main_menu(message, state)
 
 
 @dp.callback_query(F.data == "back_to_menu")
 async def back_to_menu(cb: CallbackQuery, state: FSMContext):
     await state.clear()
-    await cb.message.answer("Ок, вернулись в меню 👇", reply_markup=main_menu())
+    await cb.message.answer("Главное меню 👇", reply_markup=bottom_menu_kb())
     await cb.answer()
 
 
-# ---------- Profit flow ----------
-@dp.callback_query(F.data == "menu_profit")
-async def profit_start(cb: CallbackQuery, state: FSMContext):
+# ---------------------------
+# PROFIT flow
+# ---------------------------
+@dp.message(F.text == "📊 Посчитать чистую прибыль")
+async def profit_from_bottom_menu(message: Message, state: FSMContext):
     await state.set_state(ProfitFlow.cogs)
-    await cb.message.answer("Введи себестоимость товара (₽). Например: 1500")
-    await cb.answer()
+    await message.answer("Введи себестоимость товара (₽). Например: 1500")
 
 
 @dp.message(ProfitFlow.cogs)
@@ -171,31 +279,33 @@ async def profit_tax(message: Message, state: FSMContext):
         )
 
         kb = InlineKeyboardBuilder()
-        kb.button(text="⬅️ В меню", callback_data="back_to_menu")
+        kb.button(text="⬅️ В главное меню", callback_data="back_to_menu")
         kb.adjust(1)
 
         await state.clear()
         await message.answer(text, reply_markup=kb.as_markup())
+
     except Exception:
         await message.answer("Не понял число. Введи, например: 6")
 
 
-# ---------- Image flow ----------
+# ---------------------------
+# IMAGE flow
+# ---------------------------
 def image_style_kb():
     kb = InlineKeyboardBuilder()
-    kb.button(text="⚪ Белый фон (OZON)", callback_data="style_white")
+    kb.button(text="⚪️ Белый фон (OZON)", callback_data="style_white")
     kb.button(text="✨ Премиум студия", callback_data="style_premium")
     kb.button(text="🌆 Lifestyle", callback_data="style_lifestyle")
-    kb.button(text="⬅️ В меню", callback_data="back_to_menu")
+    kb.button(text="⬅️ В главное меню", callback_data="back_to_menu")
     kb.adjust(1)
     return kb.as_markup()
 
 
-@dp.callback_query(F.data == "menu_image")
-async def image_start(cb: CallbackQuery, state: FSMContext):
+@dp.message(F.text == "🖼 Фото для карточки OZON")
+async def image_from_bottom_menu(message: Message, state: FSMContext):
     await state.set_state(ImageFlow.photo)
-    await cb.message.answer("Загрузи фото товара (чёткое, товар полностью в кадре).")
-    await cb.answer()
+    await message.answer("Загрузи фото товара (чёткое, товар полностью в кадре).")
 
 
 @dp.message(ImageFlow.photo, F.photo)
@@ -224,7 +334,12 @@ async def image_choose_style(cb: CallbackQuery, state: FSMContext):
 
 
 def build_image_prompt(style_code: str, user_text: Optional[str]) -> str:
-    base = "Professional e-commerce product photo. Keep the product realistic and consistent with the original. No extra objects."
+    base = (
+        "Professional e-commerce product photo. "
+        "Keep the product realistic and consistent with the original. "
+        "No extra objects."
+    )
+
     if style_code == "style_white":
         style = "Clean white background, soft studio lighting, realistic shadow, centered composition, marketplace style."
     elif style_code == "style_premium":
@@ -251,52 +366,168 @@ async def image_make(message: Message, state: FSMContext):
 
     tg_file = await bot.get_file(file_id)
     file_bytes = await bot.download_file(tg_file.file_path)
-
     raw_bytes = file_bytes.read()
 
+    # Нормализация: Telegram -> PNG + ресайз
     image = Image.open(io.BytesIO(raw_bytes)).convert("RGBA")
 
+    max_side = 1024
+    w, h = image.size
+    scale = min(max_side / w, max_side / h, 1.0)
+    if scale < 1.0:
+        image = image.resize((int(w * scale), int(h * scale)))
+
     png_buffer = io.BytesIO()
-    image.save(png_buffer, format="PNG")
-
-    input_image_bytes = png_buffer.getvalue()
-
-
-    image = Image.open(io.BytesIO(raw_bytes)).convert("RGBA")
-    png_buffer = io.BytesIO()
-    image.save(png_buffer, format="PNG")
+    image.save(png_buffer, format="PNG", optimize=True)
     input_image_bytes = png_buffer.getvalue()
 
     try:
         result = client.images.edit(
             model="gpt-image-1",
-            image=[("image.png", input_image_bytes)],
+            image=[("image.png", input_image_bytes, "image/png")],
             prompt=prompt,
             size="1024x1024",
         )
         b64 = result.data[0].b64_json
         out = base64.b64decode(b64)
 
-        await message.answer_photo(out, caption="✅ Готово. Нажми /start чтобы сделать ещё.")
+        await message.answer_photo(out, caption="✅ Готово. Нажми «🏠 Главное меню» или /start.")
     except Exception as e:
         err = str(e)
-        if "billing_hard_limit" in err or "Billing hard limit" in err:
-            await message.answer(
-                "⚠️ Генерация изображений временно недоступна.\n"
-                "Причина: достигнут лимит оплаты OpenAI (Billing hard limit).\n\n"
-                "Решение: пополнить баланс/подключить оплату в OpenAI Billing."
-            )
-        else:
-            print("OPENAI IMAGE ERROR:", repr(e))
-            await message.answer(f"Не получилось сгенерировать. Ошибка: {type(e).__name__}")
-
-
+        kind = classify_openai_error_message(err)
+        log_openai_error(
+            context={"feature": "image_edit", "style": style_code, "user_text": user_text[:80]},
+            e=e,
+        )
+        await message.answer(user_friendly_error_text(kind))
     finally:
         await state.clear()
 
 
+# ---------------------------
+# DESCRIPTION (text) generation
+# ---------------------------
+def description_style_kb():
+    kb = InlineKeyboardBuilder()
+    kb.button(text="⚡ Коротко", callback_data="desc_short")
+    kb.button(text="🧾 Подробно", callback_data="desc_detailed")
+    kb.button(text="✨ Премиум", callback_data="desc_premium")
+    kb.button(text="⬅️ В главное меню", callback_data="back_to_menu")
+    kb.adjust(1)
+    return kb.as_markup()
+
+
+@dp.message(F.text == "📝 Создать описание")
+async def description_start(message: Message, state: FSMContext):
+    await state.set_state(DescriptionFlow.info)
+    await message.answer(
+        "Опиши товар одним сообщением.\n"
+        "Например:\n"
+        "«Мужская худи оверсайз, 100% хлопок, чёрная, размеры S-XL, без принта»\n\n"
+        "Можно добавить: бренд, материал, размеры, особенности."
+    )
+
+
+@dp.message(DescriptionFlow.info)
+async def description_got_info(message: Message, state: FSMContext):
+    await state.update_data(info=message.text.strip())
+    await state.set_state(DescriptionFlow.style)
+    await message.answer("Выбери стиль текста:", reply_markup=description_style_kb())
+
+
+@dp.callback_query(DescriptionFlow.style, F.data.startswith("desc_"))
+async def description_choose_style(cb: CallbackQuery, state: FSMContext):
+    await state.update_data(desc_style=cb.data)
+    await state.set_state(DescriptionFlow.extra)
+    await cb.message.answer(
+        "Хочешь дополнительные требования? (например: «без эмодзи», «до 500 символов», «с ключевыми словами»)\n"
+        "Если не надо — отправь: -"
+    )
+    await cb.answer()
+
+
+@dp.message(DescriptionFlow.extra)
+async def description_make(message: Message, state: FSMContext):
+    data = await state.get_data()
+    info = data.get("info", "")
+    style = data.get("desc_style", "desc_detailed")
+    extra = message.text.strip() if message.text else "-"
+
+    if style == "desc_short":
+        style_text = "Сделай коротко и по делу."
+    elif style == "desc_premium":
+        style_text = "Сделай премиально, аккуратно, без воды."
+    else:
+        style_text = "Сделай подробно, но читабельно."
+
+    extra_text = "" if extra == "-" else f"Доп. требования: {extra}"
+
+    await message.answer("⏳ Генерирую описание...")
+
+    try:
+        # Здесь модель для текста. Можно поменять на более дешёвую позже.
+        resp = client.responses.create(
+            model="gpt-4.1-mini",
+            input=(
+                "Ты помощник селлера OZON. "
+                "Сгенерируй: 1) SEO-заголовок, 2) 5 буллетов преимуществ, 3) описание 2-4 абзаца, 4) ключевые слова.\n"
+                "Не выдумывай характеристики: используй только то, что дал пользователь. Если данных мало — мягко укажи, чего не хватает.\n\n"
+                f"Товар: {info}\n"
+                f"Стиль: {style_text}\n"
+                f"{extra_text}"
+            ),
+        )
+
+        text_out = resp.output_text.strip()
+        kb = InlineKeyboardBuilder()
+        kb.button(text="⬅️ В главное меню", callback_data="back_to_menu")
+        kb.adjust(1)
+
+        await state.clear()
+        await message.answer(text_out, reply_markup=kb.as_markup())
+
+    except Exception as e:
+        err = str(e)
+        kind = classify_openai_error_message(err)
+        log_openai_error(
+            context={"feature": "text_description", "style": style, "extra": extra[:80]},
+            e=e,
+        )
+        await message.answer(user_friendly_error_text(kind))
+        await state.clear()
+
+
+# ---------------------------
+# "Мои товары" (пока заглушка)
+# ---------------------------
+@dp.message(F.text == "💼 Мои товары")
+async def my_items_placeholder(message: Message):
+    await message.answer(
+        "💼 Мои товары — скоро добавим.\n"
+        "Там будет сохранение SKU / шаблонов описаний / быстрый пересчёт цен."
+    )
+
+
+# ---------------------------
+# "Тарифы" (простая заглушка)
+# ---------------------------
+@dp.message(F.text == "💰 Тарифы")
+async def tariffs(message: Message):
+    await message.answer(
+        "💰 Тарифы (пример):\n"
+        "— Бесплатно: тест 3 генерации изображений\n"
+        "— Пакеты: 50 / 100 / 300 изображений\n"
+        "— Подписка: безлимит на тексты + скидка на изображения\n\n"
+        "Если хочешь, сделаю это меню полностью рабочим."
+    )
+
+
+# ---------------------------
+# Run
+# ---------------------------
 async def main():
     await dp.start_polling(bot)
+
 
 if __name__ == "__main__":
     import asyncio
