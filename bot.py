@@ -319,10 +319,10 @@ async def profit_tax(message: Message, state: FSMContext):
         text = (
             "📊 Расчёт:\n\n"
             f"Цена продажи: {x.price:,.0f} ₽\n"
-            f"Комиссия: -{r['commission']:,.0f} ₽\n"
-            f"Логистика: -{x.logistics:,.0f} ₽\n"
-            f"Налог: -{r['tax']:,.0f} ₽\n"
-            f"Себестоимость: -{x.cogs:,.0f} ₽\n\n"
+            f"Комиссия: {r['commission']:,.0f} ₽\n"
+            f"Логистика: {x.logistics:,.0f} ₽\n"
+            f"Налог: {r['tax']:,.0f} ₽\n"
+            f"Себестоимость: {x.cogs:,.0f} ₽\n\n"
             f"✅ Чистая прибыль: {r['profit']:,.0f} ₽\n"
             f"📈 Маржа: {r['margin_pct']:.1f}%\n"
         )
