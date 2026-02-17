@@ -251,7 +251,16 @@ async def image_make(message: Message, state: FSMContext):
 
     tg_file = await bot.get_file(file_id)
     file_bytes = await bot.download_file(tg_file.file_path)
+
     raw_bytes = file_bytes.read()
+
+    image = Image.open(io.BytesIO(raw_bytes)).convert("RGBA")
+
+    png_buffer = io.BytesIO()
+    image.save(png_buffer, format="PNG")
+
+    input_image_bytes = png_buffer.getvalue()
+
 
     image = Image.open(io.BytesIO(raw_bytes)).convert("RGBA")
     png_buffer = io.BytesIO()
